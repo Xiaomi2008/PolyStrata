@@ -354,8 +354,15 @@ struct Session {
     static CacheOptions with_floor(const CacheFlags& f) {
         CacheOptions o = f.o;
         o.log = stderr;
-        o.admit = [floor = (uint64_t) f.min_free_mib << 20](size_t bytes) {
-            return strata::core::conversation_memory_admit(strata::core::available_host_bytes(), bytes, floor);
+        // STRATA_POLY_PARK_RECLAIM_MIB (local): this much of the model file's pages counts as free too.  The weights
+        // the card holds were read from the file once, at load, and stay in this process's working set, where the
+        // system's "available" does not count them although it drops them first, unread since, when memory is asked.
+        const char* rc = std::getenv("STRATA_POLY_PARK_RECLAIM_MIB");
+        const uint64_t reclaim = rc && std::atoll(rc) > 0 ? (uint64_t) std::atoll(rc) << 20 : 0;
+        o.admit = [floor = (uint64_t) f.min_free_mib << 20, reclaim](size_t bytes) {
+            std::optional<uint64_t> avail = strata::core::available_host_bytes();
+            if (avail) *avail += reclaim;
+            return strata::core::conversation_memory_admit(avail, bytes, floor);
         };
         return o;
     }
@@ -877,6 +884,20 @@ int serve(Session& ss) {
                     r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right, (long long) r.guessed,
                     (long long) r.resume, hits, hits + misses, (long long) r.read);
         std::fflush(stdout);
+        if (std::getenv("STRATA_POLY_REQ_STATS")) {   // local profiling: where an answer's time went
+            const double tok = (double) std::max<int64_t>(now.tokens - before.tokens, 1);
+            std::fprintf(stderr,
+                         "strata-poly: answer %lld tokens in %.0f ms (%lld evaluated); a token: CPU experts %.2f ms, "
+                         "router wait %.2f ms; experts %.2f on the card, %.2f on the CPU, %.2f left out; %lld swapped in\n",
+                         (long long) r.produced, r.decode_ms, (long long) (now.tokens - before.tokens),
+                         (now.cpu_ms - before.cpu_ms) / tok, (now.route_wait_ms - before.route_wait_ms) / tok,
+                         (double) hits / tok, (double) misses / tok,
+                         (double) (now.tail_experts - before.tail_experts) / tok,
+                         (long long) (now.swapped_experts - before.swapped_experts));
+            std::fprintf(stderr, "strata-poly: draft block: %lld experts on the card, %lld on the CPU, %.0f ms of CPU\n",
+                         (long long) (now.draft_gpu - before.draft_gpu), (long long) (now.draft_cpu - before.draft_cpu),
+                         now.draft_cpu_ms - before.draft_cpu_ms);
+        }
         if (admit >= 0) {
             Slot& sl = slots[(size_t) admit];
             const bool goes_on = std::strcmp(r.finish, "length") == 0 && first >= 0 && admit_max > 1 &&
@@ -1086,6 +1107,8 @@ void usage() {
                  "  --tail-skip N          an expert outside VRAM that every token of a window ranks at place N+1\n"
                  "                         or later among its experts is left out: faster, and the answers move a\n"
                  "                         little (default 0 = none is; setup gives Qwen3.6 6)\n"
+                 "  --skip-weight F        in place of --tail-skip: an expert outside VRAM that every token of a\n"
+                 "                         window weighs under F of its experts' weight is left out\n"
                  "environment: STRATA_ROUTE_TAIL_SKIP=N  in place of --tail-skip (0 turns it off)\n");
 }
 
@@ -1147,6 +1170,7 @@ int main(int argc, char** argv) {
         else if (a == "--draft-model") o.draft_model = val();
         else if (a == "--expert-swaps") o.expert_swaps = std::atoi(val());
         else if (a == "--tail-skip") o.tail_skip = std::atoi(val());
+        else if (a == "--skip-weight") o.skip_weight = (float) std::atof(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--check-batch") check = std::atoi(val());
@@ -1209,7 +1233,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",
                      ms_since(t0) / 1000.0, engine.cached_experts(), engine.total_experts(), engine.cached_gib(),
                      engine.threads());
-        if (o.tail_skip > 0)
+        if (o.skip_weight > 0)
+            std::fprintf(stderr, "strata-poly: skip weight %.3f: an expert outside VRAM that every token of a window "
+                                 "weighs under %.1f%% of its experts is left out (in place of --tail-skip)\n",
+                         o.skip_weight, 100.0 * o.skip_weight);
+        else if (o.tail_skip > 0)
             std::fprintf(stderr, "strata-poly: tail skip %d: an expert outside VRAM that every token of a window ranks "
                                  "at place %d or later among its experts is left out; STRATA_ROUTE_TAIL_SKIP=0 turns "
                                  "it off\n",

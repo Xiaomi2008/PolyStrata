@@ -78,6 +78,9 @@ struct Options {
     int tail_skip = 0;            ///< a routed expert outside VRAM that every token of a call ranks this far down or
                                   ///< further (the router's first choice is 0) is left out (--tail-skip,
                                   ///< STRATA_ROUTE_TAIL_SKIP); 0: none is
+    float skip_weight = 0;        ///< in place of tail_skip: a routed expert outside VRAM whose router weight is under
+                                  ///< this share of its token's, for every token of the call, is left out
+                                  ///< (--skip-weight; local build)
     std::string layer_split;      ///< the layers across the CUDA devices this process sees, in their order: "auto"
                                   ///< (by each card's free VRAM) or the first layer of each later card ("20,30");
                                   ///< empty, or one device: the current card alone
@@ -137,6 +140,8 @@ struct Stats {
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
     double cpu_ms = 0, route_wait_ms = 0;
+    int64_t draft_gpu = 0, draft_cpu = 0;   ///< of gpu_experts and cpu_experts: the draft block's (local profiling)
+    double draft_cpu_ms = 0;
 };
 
 /// The most likely token of n logits: the first of the largest.
@@ -521,6 +526,7 @@ protected:
     mutable Stats all_stats_;             ///< stats() of every card's engine together
     double node_share_ = 0;
     std::thread mapper_;                  ///< reads the experts' pages once after load, so they are mapped
+    std::vector<char> pinned_layer_;      ///< a layer's mapped experts are registered with CUDA: stage() uploads from them
     std::atomic<bool> map_quit_{false};
     void* st_ = nullptr;   ///< the stream everything but the staging ahead runs on
     void* blas_ = nullptr; ///< cuBLAS on st_

@@ -405,6 +405,8 @@ void* Engine::dmalloc(size_t bytes, const char* what) {
                                  " MiB): " + cudaGetErrorString(e));
     }
     dev_allocs_.push_back(p);
+    if (bytes >= (size_t(16) << 20) && std::getenv("STRATA_POLY_VRAM_LOG"))   // local profiling
+        std::fprintf(stderr, "strata-poly: VRAM %zu MiB for %s\n", bytes >> 20, what);
     return p;
 }
 
@@ -512,6 +514,8 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
                                      " MiB more)");
         }
     }
+    if (std::getenv("STRATA_POLY_VRAM_LOG"))   // local profiling
+        std::fprintf(stderr, "strata-poly: VRAM mapped %zu MiB for %s\n", m.mapped >> 20, what);
 }
 
 // Gives back the pieces of m that lie past its first `bytes`.  The card must be done with them.
@@ -1441,10 +1445,28 @@ void Engine::follow_loop() {
         lk.unlock();
         const Layer& L = layers_[(size_t) s->il];
         const size_t e = (size_t) s->e, gu = L.gu_bytes;
-        std::memcpy(s->pinned, L.exp_gate + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + gu, L.exp_up + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + 2 * gu, L.exp_down + e * L.d_bytes, L.d_bytes);
-        cudaError_t err = cudaMemcpyAsync(s->slot, s->pinned, 2 * gu + L.d_bytes, cudaMemcpyHostToDevice, cs(swap_st_));
+        cudaError_t err = cudaSuccess;
+        if ((size_t) s->il < pinned_layer_.size() && pinned_layer_[(size_t) s->il]) {
+            // straight from the registered file view: the expert crosses RAM once, not three times (read, written
+            // to the pinned buffer, read again), which the CPU's experts felt (local build: 36-37 against 39-42
+            // GB/s with ~4 swaps a token, GLM 5.3 Flash)
+            const cudaStream_t ss = cs(swap_st_);
+            if (L.exp_up == L.exp_gate + gu && L.gu_stride == 2 * gu) {
+                err = cudaMemcpyAsync(s->slot, L.exp_gate + e * L.gu_stride, 2 * gu, cudaMemcpyHostToDevice, ss);
+            } else {
+                err = cudaMemcpyAsync(s->slot, L.exp_gate + e * L.gu_stride, gu, cudaMemcpyHostToDevice, ss);
+                if (err == cudaSuccess)
+                    err = cudaMemcpyAsync(s->slot + gu, L.exp_up + e * L.gu_stride, gu, cudaMemcpyHostToDevice, ss);
+            }
+            if (err == cudaSuccess)
+                err = cudaMemcpyAsync(s->slot + 2 * gu, L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice,
+                                      ss);
+        } else {
+            std::memcpy(s->pinned, L.exp_gate + e * L.gu_stride, gu);
+            std::memcpy(s->pinned + gu, L.exp_up + e * L.gu_stride, gu);
+            std::memcpy(s->pinned + 2 * gu, L.exp_down + e * L.d_bytes, L.d_bytes);
+            err = cudaMemcpyAsync(s->slot, s->pinned, 2 * gu + L.d_bytes, cudaMemcpyHostToDevice, cs(swap_st_));
+        }
         if (err == cudaSuccess) err = cudaEventRecord(s->done, cs(swap_st_));
         lk.lock();
         if (err != cudaSuccess) {
@@ -1714,9 +1736,97 @@ void Engine::load(const Options& o) {
     route_tmp_.assign((size_t) workers_->threads() * 2 * n_expert_, 0.f);
     start_swaps();
     reset();
+    // STRATA_POLY_PIN_EXPERTS (an experiment): a layer's expert pages registered with CUDA, so that a prompt's copy
+    // of its experts outside VRAM goes from the file cache to the card without the pass through the pinned buffers.
+    // Layers in order, as many as the system lets the driver lock.
+    pinned_layer_.assign(layers_.size(), 0);
+    bool any_pinned = false;
+    if (!all_cached() && std::getenv("STRATA_POLY_PIN_EXPERTS")) {
+        const Clock::time_point t0 = Clock::now();
+        size_t done = 0;
+        int n_pinned = 0;
+        const auto reg = [&](const uint8_t* p, size_t n) {
+            const uintptr_t lo = (uintptr_t) p & ~uintptr_t(4095), hi = ((uintptr_t) p + n + 4095) & ~uintptr_t(4095);
+            if (cudaHostRegister((void*) lo, hi - lo, cudaHostRegisterReadOnly) != cudaSuccess) {
+                cudaGetLastError();
+                return (const uint8_t*) nullptr;
+            }
+            done += hi - lo;
+            return (const uint8_t*) lo;
+        };
+        const size_t budget = (size_t) std::max(0LL, std::atoll(std::getenv("STRATA_POLY_PIN_EXPERTS"))) << 20;
+        for (size_t il = 0; il < layers_.size(); ++il) {
+            const Layer& L = layers_[il];
+            if (!L.moe) continue;
+            if (budget && done + (size_t) n_expert_ * (L.gu_stride + (L.gu_stride == L.gu_bytes ? L.gu_bytes : 0) + L.d_bytes) > budget)
+                break;
+            const bool fused = L.gu_stride != L.gu_bytes;
+            const uint8_t* a = reg(L.exp_gate, (size_t) n_expert_ * L.gu_stride);
+            const uint8_t* b = a && !fused ? reg(L.exp_up, (size_t) n_expert_ * L.gu_bytes) : a;
+            const uint8_t* d = b ? reg(L.exp_down, (size_t) n_expert_ * L.d_bytes) : nullptr;
+            if (!d) {   // this layer's are given back, and no later layer is tried
+                if (b && b != a) cudaHostUnregister((void*) b);
+                if (a) cudaHostUnregister((void*) a);
+                break;
+            }
+            pinned_layer_[il] = 1;
+            ++n_pinned;
+        }
+        any_pinned = n_pinned > 0;
+        std::fprintf(stderr, "strata-poly: the experts of %d layers pinned (%zu MiB) in %.1f s\n", n_pinned,
+                     done >> 20, ms_since(t0) / 1000.0);
+    }
+    (void) any_pinned;
     // nothing is read from the files when every expert is in VRAM
     if (!all_cached())
         mapper_ = std::thread([this, spans = std::move(spans)] { map_pages(spans, map_quit_); });
+    // STRATA_POLY_EXPERT_BENCH=calls (local profiling): cpu_experts() on 4 random experts of a random pinned Q2_K
+    // layer a call, one token, as an answer's calls are; prints the read rate and exits
+    if (const char* b = std::getenv("STRATA_POLY_EXPERT_BENCH"); b && workers_) {
+        const auto envi = [](const char* n, int d) { return std::getenv(n) ? std::atoi(std::getenv(n)) : d; };
+        const bool all = envi("EB_ALL", 0) != 0;   // every MoE layer, pinned or not, of any type
+        const int k = std::clamp(envi("EB_K", 4), 1, 8), gap_us = envi("EB_GAP_US", 0), spin_us = envi("EB_SPIN_US", 0);
+        std::vector<int> pick;
+        for (size_t il = 0; il < pinned_layer_.size(); ++il)
+            if (layers_[il].moe && il < (size_t) n_layer_ &&
+                (all || (pinned_layer_[il] && layers_[il].gu_type == 10 && layers_[il].d_type == 10)))
+                pick.push_back((int) il);
+        if (pick.empty()) throw std::runtime_error("expert bench: no pinned Q2_K layer");
+        if (mapper_.joinable()) mapper_.join();   // its reads of every page would share the bandwidth
+        const int calls = std::max(1, std::atoi(b));
+        const std::function<void()> busy = [&] {   // what the card's launches take of a thread
+            const Clock::time_point s0 = Clock::now();
+            while (ms_since(s0) * 1000.0 < spin_us) _mm_pause();
+        };
+        std::vector<float> x((size_t) n_embd_), out((size_t) n_embd_);
+        uint32_t seed = 12345;
+        const auto rnd = [&] { return seed = seed * 1664525u + 1013904223u; };
+        for (float& v : x) v = (float) (rnd() >> 8) / 16777216.f - 0.5f;
+        for (int rep = 0; rep < 3; ++rep) {
+            double bytes = 0;
+            const Clock::time_point t0 = Clock::now();
+            for (int c = 0; c < calls; ++c) {
+                const Layer& L = layers_[(size_t) pick[rnd() % pick.size()]];
+                CpuExpert host[8];
+                for (int j = 0; j < k; ++j) {
+                    const size_t e = rnd() % (uint32_t) n_expert_;
+                    host[j] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride, L.exp_down + e * L.d_bytes,
+                               0.25f, 0};
+                }
+                cpu_experts(*workers_, host, k, 1, (int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_, x.data(),
+                            1e30f, false, out.data(), spin_us > 0 ? &busy : nullptr);
+                if (gap_us > 0) {
+                    const Clock::time_point g0 = Clock::now();
+                    while (ms_since(g0) * 1000.0 < gap_us) _mm_pause();
+                }
+                bytes += (double) k * (2.0 * (double) L.gu_bytes + (double) L.d_bytes);
+            }
+            const double ms = ms_since(t0) - (double) calls * gap_us / 1000.0;
+            std::fprintf(stderr, "expert bench: %d calls of %d experts over %zu layers, %.3f ms a call, %.1f GB/s\n",
+                         calls, k, pick.size(), ms / calls, bytes / ms / 1e6);
+        }
+        std::exit(0);
+    }
 }
 
 void Engine::load_drafter() {
@@ -1762,7 +1872,10 @@ void Engine::shared_scratch() {
 void Engine::alloc() {
     // --dump-layers prints one token's stages
     rows_ = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
-    const size_t most = std::min<size_t>(kReadBytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
+    // STRATA_POLY_READ_MIB (an experiment): the host memory for a read's rows, kReadBytes unless it says more
+    const char* read_mib = std::getenv("STRATA_POLY_READ_MIB");
+    const size_t read_bytes = read_mib && std::atoll(read_mib) > 0 ? (size_t) std::atoll(read_mib) << 20 : kReadBytes;
+    const size_t most = std::min<size_t>(read_bytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
     read_rows_ = rows_ < kStageRows ? rows_ : std::max(rows_, (int) most / rows_ * rows_);
     rec_n_ = recurrent_floats();
     state_n_ = rec_n_ + (draft_ ? (size_t) n_embd_ : 0);
@@ -1966,6 +2079,7 @@ const Stats& Engine::stats() const {
         all_stats_.swapped_experts += s.swapped_experts;
         all_stats_.tail_experts += s.tail_experts;
         all_stats_.cpu_ms += s.cpu_ms;
+        all_stats_.draft_gpu += s.draft_gpu, all_stats_.draft_cpu += s.draft_cpu, all_stats_.draft_cpu_ms += s.draft_cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
     return all_stats_;
@@ -2089,12 +2203,16 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         CpuExpert host[kCpuRows * kMaxUsed];
         Cached cached[kCpuRows * kMaxUsed];
         int32_t host_e[kCpuRows * kMaxUsed], host_k[kCpuRows * kMaxUsed];   // a host entry's expert and its place
+        float host_rel[kCpuRows * kMaxUsed];   // its weight's share of its token's
         int n_host = 0, n_cached = 0;
         for (int t = 0; t < m; ++t) {
             int ids[kMaxUsed];
             float w[kMaxUsed];
             route(il, h_rl_ + (size_t) (at + t) * n_expert_, tok_ ? tok_[at + t] : -1, ids, w, route_tmp_.data());
+            float w_all = 0.f;
+            for (int k = 0; k < n_used_; ++k) w_all += w[k];
             for (int k = 0; k < n_used_; ++k) {
+                host_rel[n_host] = w_all > 0.f ? w[k] / w_all : 1.f;
                 const size_t e = (size_t) ids[k];
                 ++use_[(size_t) il * n_expert_ + e];
                 if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
@@ -2110,7 +2228,28 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
         // adds little to any of them, so it is not computed.  The others keep the weights the router gave them.
-        if (opt_.tail_skip > 0) {
+        // Options::skip_weight in place of the places: one whose weight is under that share of its token's, for every
+        // token here.  For the same change of the answers it leaves out more than the places do, as it keeps an
+        // expert the router weighs high at any place (GLM 5.3 Flash 3.0BIT, 6 prompts x 200 tokens, KL of the next
+        // token against none left out: places 6+ 0.043 with 113K left out; weight under 0.10 0.046 with 145K).
+        // The draft block's own share (local build: 0.2, STRATA_POLY_DRAFT_SKIP_W; 0 turns it off).  Its experts make
+        // guesses only, which the model checks, so the answers stay as they are whatever it leaves out; at 0.2 its
+        // CPU time fell from ~260 to ~50 ms an answer of 300 tokens and the windows chosen stayed the same.
+        static const float draft_w = std::getenv("STRATA_POLY_DRAFT_SKIP_W")
+                                         ? (float) std::atof(std::getenv("STRATA_POLY_DRAFT_SKIP_W")) : 0.2f;
+        const float skip_w = il >= n_layer_ && draft_w > 0.f ? draft_w
+                             : std::getenv("STRATA_POLY_SKIP_W") ? (float) std::atof(std::getenv("STRATA_POLY_SKIP_W"))
+                                                                : opt_.skip_weight;
+        if (skip_w > 0.f) {
+            int kept = 0;
+            for (int i = 0; i < n_host; ++i) {
+                bool low = true;
+                for (int j = 0; j < n_host && low; ++j) low = host_e[j] != host_e[i] || host_rel[j] < skip_w;
+                if (low) ++stats_.tail_experts;
+                else host[kept++] = host[i];
+            }
+            n_host = kept;
+        } else if (opt_.tail_skip > 0) {
             int kept = 0;
             for (int i = 0; i < n_host; ++i) {
                 bool low = true;
@@ -2122,6 +2261,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         }
         stats_.gpu_experts += n_cached;
         stats_.cpu_experts += n_host;
+        if (il >= n_layer_) stats_.draft_gpu += n_cached, stats_.draft_cpu += n_host;
         // The launches cost this thread more than they cost the card, so each one less counts.  The cached experts
         // go kSlots at a time, a launch a stage for all of them: gate and up, the activation, its quantization,
         // down.  Then one launch adds up to kSumRows of them into their tokens' rows, in the order they came.  A
@@ -2182,6 +2322,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     h_x_ + (size_t) at * e_row, limit, gelu_, cpu,
                     n_cached > 0 || (first && at == 0) ? &launch : nullptr);
         stats_.cpu_ms += ms_since(t0);
+        if (il >= n_layer_) stats_.draft_cpu_ms += ms_since(t0);
     }
     return any_host;
 }
@@ -2243,6 +2384,33 @@ bool Engine::moe_card(Layer& L, int il, int n) {
 void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone) {
     staged_il_ = -1;   // whatever the buffer held
     const size_t gu2 = 2 * L.gu_bytes, down_at = pad((size_t) m * gu2);
+    const size_t li = (size_t) (&L - layers_.data());   // a layer of layers_, or another's (a draft block)
+    if (&L >= layers_.data() && li < pinned_layer_.size() && pinned_layer_[li]) {   // straight from the registered file view; a run of experts in a row is one copy
+        const cudaStream_t s = cs(stream);
+        const bool fused = L.exp_up == L.exp_gate + L.gu_bytes && L.gu_stride == gu2;
+        for (int j = 0; j < m;) {
+            int k = j + 1;
+            while (k < m && experts[k] == experts[k - 1] + 1) ++k;
+            const size_t e = (size_t) experts[j], n = (size_t) (k - j);
+            if (fused) {
+                ck(cudaMemcpyAsync(stage_ + (size_t) j * gu2, L.exp_gate + e * L.gu_stride, n * gu2,
+                                   cudaMemcpyHostToDevice, s), "expert staging");
+            } else {
+                for (size_t q = 0; q < n; ++q) {
+                    ck(cudaMemcpyAsync(stage_ + (size_t) (j + q) * gu2, L.exp_gate + (e + q) * L.gu_stride,
+                                       L.gu_bytes, cudaMemcpyHostToDevice, s), "expert staging");
+                    ck(cudaMemcpyAsync(stage_ + (size_t) (j + q) * gu2 + L.gu_bytes, L.exp_up + (e + q) * L.gu_stride,
+                                       L.gu_bytes, cudaMemcpyHostToDevice, s), "expert staging");
+                }
+            }
+            ck(cudaMemcpyAsync(stage_ + down_at + (size_t) j * L.d_bytes, L.exp_down + e * L.d_bytes, n * L.d_bytes,
+                               cudaMemcpyHostToDevice, s), "expert staging");
+            j = k;
+        }
+        ck(cudaMemsetAsync(stage_ + down_at + (size_t) m * L.d_bytes, 0, kTail, s), "expert staging");
+        (void) alone;
+        return;
+    }
     const int per = (int) (chunk_bytes_ / (gu2 + L.d_bytes));
     for (int j0 = 0; j0 < m; j0 += per) {
         const size_t c = (size_t) std::min(per, m - j0);
@@ -3002,12 +3170,39 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
 }
 
 // A layer for n tokens, as run() hands it to the card when nothing is replayed or printed.
+namespace {
+// STRATA_POLY_READ_TIMING's split of a prompt batch's layers (synchronized, so only for measuring)
+struct LayerTiming {
+    bool on = std::getenv("STRATA_POLY_READ_TIMING") != nullptr;
+    double head = 0, moe_first = 0, moe_rest = 0;
+    int heads = 0, firsts = 0, rests = 0, last_il = -1;
+};
+LayerTiming lt;
+}  // namespace
+
 void Engine::layer(int il, int n) {
     Layer& L = layers_[(size_t) il];
+    const bool timed = lt.on && n >= kStageRows;
+    Clock::time_point t0;
+    if (timed) {
+        ck(cudaStreamSynchronize(cs(st_)), "timing");
+        t0 = Clock::now();
+    }
     layer_head(L, il, n);
+    if (timed) {
+        ck(cudaStreamSynchronize(cs(st_)), "timing");
+        lt.head += ms_since(t0), ++lt.heads;
+        t0 = Clock::now();
+    }
     if (!L.moe) return;
     if (batched(L, n)) {
         moe_rows(L, il, n);
+        if (timed) {
+            ck(cudaStreamSynchronize(cs(st_)), "timing");
+            if (il != lt.last_il) lt.moe_first += ms_since(t0), ++lt.firsts;
+            else lt.moe_rest += ms_since(t0), ++lt.rests;
+            lt.last_il = il;
+        }
     } else {
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         moe_shared(L, il, n);
@@ -3144,9 +3339,24 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     // a turn for each layer, and one for the model's output, which the draft block keeps a row of
     const int turns = hi_ - lo_ + (draft_ ? 1 : 0);
     shared_ahead_ = true;
+    static const bool read_timing = std::getenv("STRATA_POLY_READ_TIMING") != nullptr;
+    double t_dense = 0, t_pin = 0, t_unpin = 0, t_out = 0;
+    int n_dense = 0, n_pin = 0, n_unpin = 0;
+    Clock::time_point t_layer = Clock::now();
+    const auto layer_done = [&](int il) {
+        if (!read_timing) return;
+        ck(cudaStreamSynchronize(cs(st_)), "read");
+        const double ms = ms_since(t_layer);
+        t_layer = Clock::now();
+        if (il >= n_layer_) t_out += ms;
+        else if (!layers_[(size_t) il].moe) t_dense += ms, ++n_dense;
+        else if (pinned_layer_[(size_t) il]) t_pin += ms, ++n_pin;
+        else t_unpin += ms, ++n_unpin;
+    };
     try {
         for (int k = 0; k < turns; ++k) {
             const int il = lo_ + k;
+            if (k > 0) layer_done(il - 1);
             // Between two turns the caller may give the read up.  The layers so far have the read's tokens in
             // their state and the others have not: the sequence cannot go on from here, nor from where it was.
             if (turn && k > 0 && !(*turn)(k, turns)) {
@@ -3193,6 +3403,19 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                 if (!last || c + 2 < n_calls) fetch(c + 2 < n_calls ? c + 2 : c % 2);
             }
         }
+        if (turns > 0) layer_done(lo_ + turns - 1);
+        if (read_timing) {
+            std::fprintf(stderr, "layer timing: ms a call: attention and norms %.2f (%d), MoE first call of a layer "
+                                 "%.2f (%d), MoE later calls %.2f (%d)\n",
+                         lt.heads ? lt.head / lt.heads : 0.0, lt.heads, lt.firsts ? lt.moe_first / lt.firsts : 0.0,
+                         lt.firsts, lt.rests ? lt.moe_rest / lt.rests : 0.0, lt.rests);
+            lt = LayerTiming{};
+        }
+        if (read_timing)
+            std::fprintf(stderr, "read timing: %d tokens in %d calls; ms a layer: dense %.1f (%d), MoE pinned %.1f (%d), "
+                                 "MoE not pinned %.1f (%d); output and draft %.1f; all %.0f ms\n",
+                         n, n_calls, n_dense ? t_dense / n_dense : 0.0, n_dense, n_pin ? t_pin / n_pin : 0.0, n_pin,
+                         n_unpin ? t_unpin / n_unpin : 0.0, n_unpin, t_out, t_dense + t_pin + t_unpin + t_out);
         if (host) ck(cudaStreamSynchronize(cs(rs_)), "read");
         if (next_ && !host) {   // the rows are in r_, a call's in each half
             float* h = pass_rows(n);

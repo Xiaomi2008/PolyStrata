@@ -1834,10 +1834,20 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
   endif()
 
+  # the multi-token K-quant rows: AVX2 code, called only where the CPU has it (kq_multi_ok())
+  if(MSVC)
+    set_source_files_properties(src/poly/kq_multi.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/poly/kq_multi.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  endif()
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
-                            src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/cpu_experts.cpp
+                            src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/cpu_experts.cpp src/poly/kq_multi.cpp
                             src/poly/kernels.cu src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_include_directories(strata-poly PRIVATE ${_strata_gg}/src)   # ggml-common.h, for kq_multi.cpp
+  add_executable(poly_kq_multi_test EXCLUDE_FROM_ALL src/poly/kq_multi_test.cpp src/poly/kq_multi.cpp)
+  target_include_directories(poly_kq_multi_test PRIVATE ${_strata_gg}/src)
+  target_link_libraries(poly_kq_multi_test PRIVATE ggml-cpu ggml-base)
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
   if(STRATA_ENABLE_HIP)
