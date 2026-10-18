@@ -53,6 +53,10 @@ struct Options {
     int stage_mib = 2048;         ///< the buffer the experts that are not cached pass through: by default about
                                   ///< what a layer of Q2_K experts leaves out of the cache, and never more than
                                   ///< a layer's experts take
+    int stage_read_mib = 0;       ///< a read of several calls: the staging buffer grows to this, at most what a
+                                  ///< layer's experts take, with VRAM the expert cache lends it until the read is
+                                  ///< done (end_read()), so that each layer's experts are copied once a read, not
+                                  ///< once a call; 0 (or no more than stage_mib): never
     int stage_ahead = 1024;       ///< from this many tokens, a call routes to most of a layer's experts, and the
                                   ///< ones that are not cached start their copy before the layer has routed; in a
                                   ///< read of several calls and this many tokens every call does; 0: never.  Under
@@ -213,6 +217,11 @@ public:
     /// window layer's rows among it.  The caller goes back to a state saved before (load_state()) or resets.
     bool read(const int32_t* tokens, int n, const Mark* marks = nullptr, int n_marks = 0,
               const std::function<bool(int, int)>* turn = nullptr);
+    /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib lent the staging
+    /// buffer.  window() and step() do it too, if the caller has not.
+    void end_read() {
+        if (stage_lent_) narrow_stage();
+    }
 
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
@@ -498,6 +507,8 @@ protected:
     void vmm_free(Mapped& m);
     void shrink_cache(size_t bytes);
     int grow_cache(size_t bytes);
+    void widen_stage();
+    void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
     bool mind_card_vram();
     size_t trim_card_kv(int64_t end);
@@ -684,6 +695,10 @@ protected:
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
+    Mapped stage_map_;                            ///< stage_'s VRAM when it can grow for a read (stage_read_mib)
+    size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one
+    bool stage_lent_ = false;                     ///< the expert cache has lent the buffer VRAM (widen_stage())
+    size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_;
     std::vector<float> route_tmp_;   ///< route()'s scratch, a share for each host thread
