@@ -433,6 +433,7 @@ struct Session {
                     break;
                 }
             } else {
+                if (last) engine.end_read();   // the last token, as the answer's, with the whole expert cache
                 engine.eval(ids.data() + i, (int) m, last);
             }
             kept.read(ids.data() + i, m);
@@ -448,6 +449,7 @@ struct Session {
                 break;
             }
         }
+        engine.end_read();
         kept.prompt_was(n);
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
@@ -1062,6 +1064,9 @@ void usage() {
                  "                         of them are copied after the layer has routed\n"
                  "  --stage-ahead N        from N tokens, a batch copies those experts before it routes (default 1024,\n"
                  "                         0 = never)\n"
+                 "  --stage-read-mib N     a prompt read of several batches grows the staging buffer to N MiB (at\n"
+                 "                         most a layer's experts) with VRAM the expert cache lends it until the\n"
+                 "                         answer starts (default 0 = never)\n"
                  "  --cpu-share F          under that, the share of those experts the CPU computes meanwhile, the\n"
                  "                         ones the fewest tokens chose (default: as the times say; 0 = none)\n"
                  "  --prompt-cache N       checkpoints kept of a conversation, about 150 MB of RAM each (default 6;\n"
@@ -1164,6 +1169,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-batch") o.prompt_batch = std::atoi(val());
         else if (a == "--stage-mib") o.stage_mib = std::atoi(val());
         else if (a == "--stage-ahead") o.stage_ahead = std::atoi(val());
+        else if (a == "--stage-read-mib") o.stage_read_mib = std::atoi(val());
         else if (a == "--cpu-share") o.cpu_share = (float) std::atof(val());
         else if (a == "--prompt-cache") cache.o.checkpoints = std::atoi(val());
         else if (a == "--prompt-cache-every") cache.o.every = std::atoll(val());
